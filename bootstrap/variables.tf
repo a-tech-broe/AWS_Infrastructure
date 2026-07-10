@@ -29,9 +29,15 @@ variable "create_oidc_provider" {
 }
 
 variable "allowed_subs" {
-  description = "OIDC 'sub' claims allowed to assume the role. Leave empty to allow main branch pushes and pull requests from this repo."
+  description = "OIDC 'sub' claims allowed to assume the role. Leave empty to allow main branch pushes, pull requests, and the configured environments from this repo."
   type        = list(string)
   default     = []
+}
+
+variable "github_environments" {
+  description = "GitHub Environments whose deploy jobs may assume the role. Jobs that set `environment:` get an environment-scoped OIDC sub (repo:ORG/REPO:environment:NAME)."
+  type        = list(string)
+  default     = ["dev", "stg", "prod"]
 }
 
 variable "state_bucket" {

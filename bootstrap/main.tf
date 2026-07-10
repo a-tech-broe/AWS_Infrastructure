@@ -1,11 +1,15 @@
 data "aws_caller_identity" "current" {}
 
 locals {
-  # Default trust: only the main branch and pull requests from this exact repo.
-  default_subs = [
-    "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
-    "repo:${var.github_org}/${var.github_repo}:pull_request",
-  ]
+  # Default trust: the main branch, pull requests, and each configured
+  # environment (deploy jobs use environment-scoped OIDC subs) from this repo.
+  default_subs = concat(
+    [
+      "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main",
+      "repo:${var.github_org}/${var.github_repo}:pull_request",
+    ],
+    [for e in var.github_environments : "repo:${var.github_org}/${var.github_repo}:environment:${e}"],
+  )
   allowed_subs = length(var.allowed_subs) > 0 ? var.allowed_subs : local.default_subs
 
   oidc_provider_arn = var.create_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
