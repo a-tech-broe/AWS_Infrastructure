@@ -2,6 +2,8 @@ name: Terraform
 
 # PRs run scans + validation + plan (no changes to AWS).
 # Merges to main run the actual deployments.
+# Only the environments whose files changed are planned/deployed; a change to a
+# shared module (or this workflow) rebuilds every environment.
 on:
   pull_request:
     paths:
@@ -30,6 +32,73 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 0. Detect which environments changed -> dynamic matrix.
+  #    Shared changes (modules/**, this workflow, .tflint.hcl) select all envs.
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set.outputs.environments }}
+      any: ${{ steps.set.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need both sides of the diff
+
+      - name: Compute changed environments
+        id: set
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          # Fall back to the repo's first commit if the base is missing
+          # (e.g. branch creation, shallow history).
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          fi
+
+          changed="$(git diff --name-only "$base" "$head")"
+          echo "Changed files:"; echo "$changed"
+
+          # Only environments that actually contain terraform files are
+          # deployable; empty scaffold dirs (e.g. a not-yet-built env) are skipped.
+          tf_envs="$(find environments -mindepth 2 -maxdepth 2 -name '*.tf' -printf '%h\n' \
+            | sed 's#^environments/##' | sort -u)"
+
+          if echo "$changed" | grep -qE '^(modules/|\.github/workflows/terraform\.yml|\.tflint\.hcl)'; then
+            echo "Shared change detected -> selecting all environments"
+            envs="$tf_envs"
+          else
+            candidates="$(echo "$changed" \
+              | grep -E '^environments/[^/]+/' \
+              | sed -E 's#^environments/([^/]+)/.*#\1#' \
+              | sort -u)"
+            # Keep only changed envs that still have terraform files on disk.
+            envs="$(comm -12 <(printf '%s\n' "$candidates" | grep -v '^$' | sort -u) \
+                              <(printf '%s\n' "$tf_envs"))"
+          fi
+
+          json="$(echo "$envs" | grep -v '^$' | jq -R . | jq -s -c .)"
+          [ "$json" = "null" ] && json='[]'
+
+          echo "Selected environments: $json"
+          echo "environments=$json" >> "$GITHUB_OUTPUT"
+          if [ "$json" = "[]" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # ---------------------------------------------------------------------------
   # 1. Scans & lint — runs on every PR and every push. No AWS access needed.
   # ---------------------------------------------------------------------------
@@ -70,17 +139,18 @@ jobs:
           severity: HIGH,CRITICAL
 
   # ---------------------------------------------------------------------------
-  # 2. Validate & plan per environment — read-only, needs AWS to read state.
-  #    Runs on PRs (review the plan) and on main (gate before deploy).
+  # 2. Validate & plan per changed environment — read-only, needs AWS to read
+  #    state. Runs on PRs (review the plan) and on main (gate before deploy).
   # ---------------------------------------------------------------------------
   plan:
     name: Plan (${{ matrix.environment }})
-    needs: lint
+    needs: [detect, lint]
+    if: needs.detect.outputs.any == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        environment: [dev, stg]
+        environment: ${{ fromJson(needs.detect.outputs.environments) }}
     defaults:
       run:
         working-directory: environments/${{ matrix.environment }}
@@ -109,21 +179,21 @@ jobs:
         run: terraform plan -no-color -input=false
 
   # ---------------------------------------------------------------------------
-  # 3. Deploy — apply the changes. Only on a direct push to main, and only
-  #    after scans + plan pass. Uses a GitHub Environment so you can require
-  #    manual approval per environment (Settings -> Environments).
+  # 3. Deploy — apply the changed environments. Only on a direct push to main,
+  #    and only after scans + plan pass. Uses a GitHub Environment so you can
+  #    require manual approval per environment (Settings -> Environments).
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (${{ matrix.environment }})
-    needs: plan
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [detect, plan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect.outputs.any == 'true'
     runs-on: ubuntu-latest
     environment: ${{ matrix.environment }}
     strategy:
       fail-fast: true
       max-parallel: 1 # deploy environments one at a time, in listed order
       matrix:
-        environment: [dev, stg]
+        environment: ${{ fromJson(needs.detect.outputs.environments) }}
     defaults:
       run:
         working-directory: environments/${{ matrix.environment }}
