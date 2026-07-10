@@ -40,6 +40,10 @@ resource "aws_internet_gateway" "this" {
 # ---------------------------------------------------------------------------
 # Subnets
 # ---------------------------------------------------------------------------
+# Auto-assigning a public IP is the defining trait of a public subnet, so the
+# Trivy/tfsec AVD-AWS-0164 finding does not apply here. Private subnets (below)
+# deliberately leave this off.
+#trivy:ignore:AVD-AWS-0164
 resource "aws_subnet" "public" {
   count                   = var.az_count
   vpc_id                  = aws_vpc.this.id

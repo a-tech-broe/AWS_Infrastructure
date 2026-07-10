@@ -1,38 +1,159 @@
 name: Terraform
 
+# PRs run scans + validation + plan (no changes to AWS).
+# Merges to main run the actual deployments.
+# Only the environments whose files changed are planned/deployed; a change to a
+# shared module (or this workflow) rebuilds every environment.
 on:
   pull_request:
     paths:
       - "environments/**"
       - "modules/**"
       - ".github/workflows/terraform.yml"
+      - ".tflint.hcl"
   push:
     branches: [main]
     paths:
       - "environments/**"
       - "modules/**"
 
-# Required for OIDC: id-token lets the job request a signed token from GitHub
-# that AWS trusts. No long-lived AWS keys are stored anywhere.
+# Required for OIDC: id-token lets a job request a signed token from GitHub that
+# AWS trusts. No long-lived AWS keys are stored anywhere.
 permissions:
   id-token: write
   contents: read
 
 env:
   AWS_REGION: us-east-1
-  TF_WORKING_DIR: environments/dev
+  TF_VERSION: "1.14.3"
 
 concurrency:
   group: terraform-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  terraform:
-    name: Plan / Apply
+  # ---------------------------------------------------------------------------
+  # 0. Detect which environments changed -> dynamic matrix.
+  #    Shared changes (modules/**, this workflow, .tflint.hcl) select all envs.
+  # ---------------------------------------------------------------------------
+  detect:
+    name: Detect changes
     runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set.outputs.environments }}
+      any: ${{ steps.set.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need both sides of the diff
+
+      - name: Compute changed environments
+        id: set
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          # Fall back to the repo's first commit if the base is missing
+          # (e.g. branch creation, shallow history).
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          fi
+
+          changed="$(git diff --name-only "$base" "$head")"
+          echo "Changed files:"; echo "$changed"
+
+          # Only environments that actually contain terraform files are
+          # deployable; empty scaffold dirs (e.g. a not-yet-built env) are skipped.
+          tf_envs="$(find environments -mindepth 2 -maxdepth 2 -name '*.tf' -printf '%h\n' \
+            | sed 's#^environments/##' | sort -u)"
+
+          if echo "$changed" | grep -qE '^(modules/|\.github/workflows/terraform\.yml|\.tflint\.hcl)'; then
+            echo "Shared change detected -> selecting all environments"
+            envs="$tf_envs"
+          else
+            candidates="$(echo "$changed" \
+              | grep -E '^environments/[^/]+/' \
+              | sed -E 's#^environments/([^/]+)/.*#\1#' \
+              | sort -u)"
+            # Keep only changed envs that still have terraform files on disk.
+            envs="$(comm -12 <(printf '%s\n' "$candidates" | grep -v '^$' | sort -u) \
+                              <(printf '%s\n' "$tf_envs"))"
+          fi
+
+          json="$(echo "$envs" | grep -v '^$' | jq -R . | jq -s -c .)"
+          [ "$json" = "null" ] && json='[]'
+
+          echo "Selected environments: $json"
+          echo "environments=$json" >> "$GITHUB_OUTPUT"
+          if [ "$json" = "[]" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 1. Scans & lint — runs on every PR and every push. No AWS access needed.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Scan & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: TFLint
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # avoids plugin download rate limits
+        run: |
+          tflint --init
+          tflint --recursive --format compact
+
+      - name: Trivy IaC security scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: "1" # fail the PR on findings at/above `severity`
+          severity: HIGH,CRITICAL
+
+  # ---------------------------------------------------------------------------
+  # 2. Validate & plan per changed environment — read-only, needs AWS to read
+  #    state. Runs on PRs (review the plan) and on main (gate before deploy).
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.environment }})
+    needs: [detect, lint]
+    if: needs.detect.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect.outputs.environments) }}
     defaults:
       run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: environments/${{ matrix.environment }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -40,17 +161,13 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.14.3"
-
-      - name: Terraform Format
-        working-directory: ${{ github.workspace }}
-        run: terraform fmt -check -recursive
+          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Terraform Init
         run: terraform init -input=false
@@ -61,7 +178,42 @@ jobs:
       - name: Terraform Plan
         run: terraform plan -no-color -input=false
 
-      # Only apply on a direct push to main, never on pull requests.
+  # ---------------------------------------------------------------------------
+  # 3. Deploy — apply the changed environments. Only on a direct push to main,
+  #    and only after scans + plan pass. Uses a GitHub Environment so you can
+  #    require manual approval per environment (Settings -> Environments).
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (${{ matrix.environment }})
+    needs: [detect, plan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect.outputs.any == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    strategy:
+      fail-fast: true
+      max-parallel: 1 # deploy environments one at a time, in listed order
+      matrix:
+        environment: ${{ fromJson(needs.detect.outputs.environments) }}
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: terraform apply -auto-approve -input=false
