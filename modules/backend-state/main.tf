@@ -30,7 +30,10 @@ resource "aws_s3_bucket_versioning" "state" {
   }
 }
 
-# Encrypt state at rest (it can contain secrets in plaintext).
+# Encrypt state at rest (it can contain secrets in plaintext). We use SSE-S3
+# (AES256) with AWS-managed keys rather than a customer-managed KMS key; that is
+# an accepted posture for this bucket, so AVD-AWS-0132 is intentionally ignored.
+#trivy:ignore:AVD-AWS-0132
 resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
 
