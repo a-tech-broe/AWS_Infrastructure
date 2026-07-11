@@ -10,6 +10,7 @@ on:
       - "environments/**"
       - "modules/**"
       - ".github/workflows/terraform.yml"
+      - ".github/scripts/detect-changes.py"
       - ".tflint.hcl"
   push:
     branches: [main]
@@ -54,44 +55,25 @@ jobs:
           set -euo pipefail
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
           else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
           fi
 
           # Fall back to the repo's first commit if the base is missing
           # (e.g. branch creation, shallow history).
-          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            base="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE="$(git rev-list --max-parents=0 HEAD | tail -1)"
           fi
+          export BASE HEAD
 
-          changed="$(git diff --name-only "$base" "$head")"
-          echo "Changed files:"; echo "$changed"
-
-          # Only environments that actually contain terraform files are
-          # deployable; empty scaffold dirs (e.g. a not-yet-built env) are skipped.
-          tf_envs="$(find environments -mindepth 2 -maxdepth 2 -name '*.tf' -printf '%h\n' \
-            | sed 's#^environments/##' | sort -u)"
-
-          if echo "$changed" | grep -qE '^(modules/|\.github/workflows/terraform\.yml|\.tflint\.hcl)'; then
-            echo "Shared change detected -> selecting all environments"
-            envs="$tf_envs"
-          else
-            candidates="$(echo "$changed" \
-              | grep -E '^environments/[^/]+/' \
-              | sed -E 's#^environments/([^/]+)/.*#\1#' \
-              | sort -u)"
-            # Keep only changed envs that still have terraform files on disk.
-            envs="$(comm -12 <(printf '%s\n' "$candidates" | grep -v '^$' | sort -u) \
-                              <(printf '%s\n' "$tf_envs"))"
-          fi
-
-          json="$(echo "$envs" | grep -v '^$' | jq -R . | jq -s -c .)"
-          [ "$json" = "null" ] && json='[]'
-
+          # Dependency-aware selection: each env is chosen only if its own dir or
+          # a module it (transitively) uses changed. See the script for details.
+          json="$(python3 .github/scripts/detect-changes.py)"
           echo "Selected environments: $json"
+
           echo "environments=$json" >> "$GITHUB_OUTPUT"
           if [ "$json" = "[]" ]; then
             echo "any=false" >> "$GITHUB_OUTPUT"
