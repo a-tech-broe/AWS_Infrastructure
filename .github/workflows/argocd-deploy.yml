@@ -1,0 +1,124 @@
+name: ArgoCD Deploy
+
+# Open-ended deploy flow: take an image tag, pull it from the DockerHub repo,
+# then tell ArgoCD to run that image in the target application (cluster +
+# namespace). The DockerHub repo and the target deploy environment (ArgoCD app)
+# are supplied as secrets so this workflow is generic and reusable.
+#
+# Triggers:
+#   - workflow_dispatch : run it by hand, choosing the image tag.
+#   - workflow_call     : call it from another workflow (e.g. after a build).
+#
+# Required secrets:
+#   DOCKERHUB_REPO      e.g. "myorg/myapp"  (repo only, no tag)
+#   DOCKERHUB_USERNAME  DockerHub user (for pulling private images)
+#   DOCKERHUB_TOKEN     DockerHub access token
+#   DEPLOY_ENV          ArgoCD application name = the target cluster/namespace/env
+#   ARGOCD_SERVER       ArgoCD API server, e.g. "argocd.example.com"
+#   ARGOCD_AUTH_TOKEN   ArgoCD API token (argocd account generate-token)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag (or digest) to deploy, e.g. v1.4.2 or sha-abc123
+        type: string
+        required: true
+      sync_timeout:
+        description: Seconds to wait for ArgoCD sync + health
+        type: string
+        default: "300"
+        required: false
+  workflow_call:
+    inputs:
+      image_tag:
+        type: string
+        required: true
+      sync_timeout:
+        type: string
+        default: "300"
+        required: false
+    secrets:
+      DOCKERHUB_REPO: { required: true }
+      DOCKERHUB_USERNAME: { required: true }
+      DOCKERHUB_TOKEN: { required: true }
+      DEPLOY_ENV: { required: true }
+      ARGOCD_SERVER: { required: true }
+      ARGOCD_AUTH_TOKEN: { required: true }
+
+permissions:
+  contents: read
+
+# One deploy per target environment at a time.
+concurrency:
+  group: argocd-deploy-${{ github.ref }}-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+env:
+  ARGOCD_VERSION: v2.13.2
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.image_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # --- 1. Resolve and pull the image from DockerHub --------------------
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull image and resolve digest
+        id: image
+        run: |
+          set -euo pipefail
+          IMAGE="${{ secrets.DOCKERHUB_REPO }}:${{ inputs.image_tag }}"
+          echo "Pulling ${IMAGE}"
+          docker pull "$IMAGE"
+          # Pin to the immutable digest so the cluster runs exactly what we verified.
+          DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")"
+          echo "Resolved: ${DIGEST}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # --- 2. Install the ArgoCD CLI ---------------------------------------
+      - name: Install ArgoCD CLI
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/argocd \
+            "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+          sudo install -m 555 /tmp/argocd /usr/local/bin/argocd
+          argocd version --client
+
+      # --- 3. Point ArgoCD at the new image and sync -----------------------
+      - name: Deploy via ArgoCD
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          APP: ${{ secrets.DEPLOY_ENV }}
+          REPO: ${{ secrets.DOCKERHUB_REPO }}
+          TAG: ${{ inputs.image_tag }}
+          TIMEOUT: ${{ inputs.sync_timeout }}
+        run: |
+          set -euo pipefail
+
+          # Auth is via ARGOCD_AUTH_TOKEN in the env; --grpc-web works through
+          # ingress. Add --insecure if the server uses a self-signed cert.
+          argocd login "$ARGOCD_SERVER" --grpc-web
+
+          echo "Setting image for app '${APP}' -> ${REPO}:${TAG}"
+          # Helm charts: override image.repository / image.tag. For a Kustomize
+          # app use instead:  argocd app set "$APP" --kustomize-image "${REPO}:${TAG}"
+          argocd app set "$APP" \
+            --helm-set image.repository="$REPO" \
+            --helm-set image.tag="$TAG"
+
+          echo "Syncing '${APP}'"
+          argocd app sync "$APP" --timeout "$TIMEOUT"
+
+          echo "Waiting for '${APP}' to become Healthy"
+          argocd app wait "$APP" --health --timeout "$TIMEOUT"
+
+          argocd app get "$APP"
