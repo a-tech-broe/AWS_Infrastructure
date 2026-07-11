@@ -1,25 +1,33 @@
 name: Terraform
 
-# PRs run scans + validation + plan (no changes to AWS).
-# Merges to main run the actual deployments.
-# Only the environments whose files changed are planned/deployed; a change to a
-# shared module (or this workflow) rebuilds every environment.
+# Branch-based environment promotion:
+#
+#   feature ──PR──► dev  ──push──►  deploy DEV
+#                    │
+#                    └──PR──► stg  ──push──►  deploy STG
+#                              │
+#                              └──PR──► main ──push──► deploy PROD (manual approval)
+#
+# PRs run scans + plan for the target environment (the PR's base branch).
+# Pushes/merges deploy that environment. Prod is gated by the `prod` GitHub
+# Environment's required reviewers.
 on:
-  pull_request:
+  push:
+    branches: [dev, stg, main]
     paths:
       - "environments/**"
       - "modules/**"
       - ".github/workflows/terraform.yml"
-      - ".github/scripts/detect-changes.py"
       - ".tflint.hcl"
-  push:
-    branches: [main]
+  pull_request:
+    branches: [dev, stg, main]
     paths:
       - "environments/**"
       - "modules/**"
+      - ".github/workflows/terraform.yml"
+      - ".tflint.hcl"
 
-# Required for OIDC: id-token lets a job request a signed token from GitHub that
-# AWS trusts. No long-lived AWS keys are stored anywhere.
+# OIDC: id-token lets a job mint a signed token AWS trusts. No static keys.
 permissions:
   id-token: write
   contents: read
@@ -28,65 +36,49 @@ env:
   AWS_REGION: us-east-1
   TF_VERSION: "1.14.3"
 
+# Cancel superseded PR runs; never cancel an in-flight push/deploy.
 concurrency:
-  group: terraform-${{ github.ref }}
-  cancel-in-progress: false
+  group: terraform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 0. Detect which environments changed -> dynamic matrix.
-  #    Shared changes (modules/**, this workflow, .tflint.hcl) select all envs.
+  # Map the branch (push ref, or PR base branch) to a target environment.
   # ---------------------------------------------------------------------------
-  detect:
-    name: Detect changes
+  target:
+    name: Resolve target
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      environments: ${{ steps.set.outputs.environments }}
-      any: ${{ steps.set.outputs.any }}
+      env: ${{ steps.map.outputs.env }}
+      dir: ${{ steps.map.outputs.dir }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # need both sides of the diff
-
-      - name: Compute changed environments
-        id: set
+      - name: Map branch to environment
+        id: map
         run: |
           set -euo pipefail
-
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-            HEAD="${{ github.event.pull_request.head.sha }}"
+            branch="${{ github.base_ref }}"
           else
-            BASE="${{ github.event.before }}"
-            HEAD="${{ github.sha }}"
+            branch="${{ github.ref_name }}"
           fi
-
-          # Fall back to the repo's first commit if the base is missing
-          # (e.g. branch creation, shallow history).
-          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
-            BASE="$(git rev-list --max-parents=0 HEAD | tail -1)"
-          fi
-          export BASE HEAD
-
-          # Dependency-aware selection: each env is chosen only if its own dir or
-          # a module it (transitively) uses changed. See the script for details.
-          json="$(python3 .github/scripts/detect-changes.py)"
-          echo "Selected environments: $json"
-
-          echo "environments=$json" >> "$GITHUB_OUTPUT"
-          if [ "$json" = "[]" ]; then
-            echo "any=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "any=true" >> "$GITHUB_OUTPUT"
-          fi
+          case "$branch" in
+            dev)  env=dev ;;
+            stg)  env=stg ;;
+            main) env=prod ;;
+            *) echo "::error::branch '$branch' is not mapped to an environment"; exit 1 ;;
+          esac
+          echo "Target environment: $env"
+          echo "env=$env" >> "$GITHUB_OUTPUT"
+          echo "dir=environments/$env" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # 1. Scans & lint — runs on every PR and every push. No AWS access needed.
+  # Scans & lint — every PR and push. No AWS access.
   # ---------------------------------------------------------------------------
   lint:
     name: Scan & Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -106,7 +98,7 @@ jobs:
 
       - name: TFLint
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # avoids plugin download rate limits
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tflint --init
           tflint --recursive --format compact
@@ -117,25 +109,22 @@ jobs:
           scan-type: config
           scan-ref: .
           format: table
-          exit-code: "1" # fail the PR on findings at/above `severity`
+          exit-code: "1"
           severity: HIGH,CRITICAL
 
   # ---------------------------------------------------------------------------
-  # 2. Validate & plan per changed environment — read-only, needs AWS to read
-  #    state. Runs on PRs (review the plan) and on main (gate before deploy).
+  # Plan the target environment on PRs (review before merge). Read-only.
+  # Uses the pull_request OIDC sub, which the role trust already allows.
   # ---------------------------------------------------------------------------
   plan:
-    name: Plan (${{ matrix.environment }})
-    needs: [detect, lint]
-    if: needs.detect.outputs.any == 'true'
+    name: Plan (${{ needs.target.outputs.env }})
+    needs: [target, lint]
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        environment: ${{ fromJson(needs.detect.outputs.environments) }}
+    timeout-minutes: 20
     defaults:
       run:
-        working-directory: environments/${{ matrix.environment }}
+        working-directory: ${{ needs.target.outputs.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,24 +150,23 @@ jobs:
         run: terraform plan -no-color -input=false
 
   # ---------------------------------------------------------------------------
-  # 3. Deploy — apply the changed environments. Only on a direct push to main,
-  #    and only after scans + plan pass. Uses a GitHub Environment so you can
-  #    require manual approval per environment (Settings -> Environments).
+  # Deploy the target environment on push/merge. Bound to the matching GitHub
+  # Environment, so `prod` can require manual approval before it runs. Applies
+  # the exact plan it just computed. Uses the environment-scoped OIDC sub.
   # ---------------------------------------------------------------------------
   deploy:
-    name: Deploy (${{ matrix.environment }})
-    needs: [detect, plan]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.detect.outputs.any == 'true'
+    name: Deploy (${{ needs.target.outputs.env }})
+    needs: [target, lint]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: ${{ matrix.environment }}
-    strategy:
-      fail-fast: true
-      max-parallel: 1 # deploy environments one at a time, in listed order
-      matrix:
-        environment: ${{ fromJson(needs.detect.outputs.environments) }}
+    timeout-minutes: 30
+    environment: ${{ needs.target.outputs.env }}
+    concurrency:
+      group: deploy-${{ needs.target.outputs.env }}
+      cancel-in-progress: false
     defaults:
       run:
-        working-directory: environments/${{ matrix.environment }}
+        working-directory: ${{ needs.target.outputs.dir }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -197,5 +185,8 @@ jobs:
       - name: Terraform Init
         run: terraform init -input=false
 
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan -input=false
+
       - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false
+        run: terraform apply -input=false tfplan
