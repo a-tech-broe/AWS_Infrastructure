@@ -173,11 +173,27 @@ groups and IAM roles are free. Fargate bills only when tasks run
 (~$0.04/vCPU-hr + $0.0044/GB-hr on-demand; Spot ~70% less), plus a small
 Container Insights metrics charge while tasks are running.
 
-Tear an environment down with:
+Tear a single environment's infrastructure down with:
 
 ```bash
 cd environments/<env> && terraform destroy
 ```
+
+Or use the **Destroy Environment** workflow (Actions → Run workflow → pick env,
+type the name to confirm) — approval-gated for `prod`.
+
+### Full teardown
+
+To destroy **everything** the repo created — environments, CI role, OIDC
+provider, state bucket + lock table, and Parah's access — in dependency order:
+
+```bash
+AWS_PROFILE=default ./scripts/destroy-all.sh
+```
+
+It runs environments first, then bootstrap, empties and deletes the state
+bucket (bypassing `prevent_destroy`), and removes `ParahAccess` last (since
+Parah's own permissions drive the teardown). See the script header for details.
 
 ## Notes
 
