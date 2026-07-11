@@ -107,6 +107,7 @@ data "aws_iam_policy_document" "vpc" {
       "ec2:DisassociateRouteTable",
       "ec2:CreateRoute",
       "ec2:DeleteRoute",
+      "ec2:ReplaceRoute",
       "ec2:AllocateAddress",
       "ec2:ReleaseAddress",
       "ec2:DescribeAddresses",
