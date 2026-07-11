@@ -121,11 +121,75 @@ data "aws_iam_policy_document" "vpc" {
     ]
     resources = ["*"]
   }
+
+  # ECS cluster + capacity providers + CloudWatch log group for the ecs module.
+  statement {
+    sid    = "EcsClusterAndLogs"
+    effect = "Allow"
+    actions = [
+      "ecs:CreateCluster",
+      "ecs:DeleteCluster",
+      "ecs:DescribeClusters",
+      "ecs:UpdateCluster",
+      "ecs:UpdateClusterSettings",
+      "ecs:PutClusterCapacityProviders",
+      "ecs:TagResource",
+      "ecs:UntagResource",
+      "ecs:ListTagsForResource",
+      "logs:CreateLogGroup",
+      "logs:DeleteLogGroup",
+      "logs:DescribeLogGroups",
+      "logs:PutRetentionPolicy",
+      "logs:TagResource",
+      "logs:UntagResource",
+      "logs:ListTagsForResource",
+      "logs:AssociateKmsKey",
+      "logs:DisassociateKmsKey",
+    ]
+    resources = ["*"]
+  }
+
+  # Security groups for Fargate tasks.
+  statement {
+    sid    = "EcsSecurityGroups"
+    effect = "Allow"
+    actions = [
+      "ec2:CreateSecurityGroup",
+      "ec2:DeleteSecurityGroup",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeSecurityGroupRules",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupEgress",
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:RevokeSecurityGroupIngress",
+    ]
+    resources = ["*"]
+  }
+
+  # Task execution/task roles, scoped to this project's naming.
+  statement {
+    sid    = "EcsTaskRoles"
+    effect = "Allow"
+    actions = [
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:GetRole",
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:ListInstanceProfilesForRole",
+      "iam:PassRole",
+    ]
+    resources = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-infrastructure-*"]
+  }
 }
 
 resource "aws_iam_policy" "vpc" {
-  name        = "${var.role_name}-vpc"
-  description = "VPC/networking actions Terraform needs to manage the environments."
+  name        = "${var.role_name}-infra"
+  description = "VPC, ECS and supporting actions Terraform needs to manage the environments."
   policy      = data.aws_iam_policy_document.vpc.json
 }
 

@@ -22,3 +22,18 @@ output "availability_zones" {
   description = "AZs the subnets span."
   value       = module.vpc.availability_zones
 }
+
+output "ecs_cluster_name" {
+  description = "Name of the ECS cluster."
+  value       = module.ecs.cluster_name
+}
+
+output "ecs_cluster_arn" {
+  description = "ARN of the ECS cluster."
+  value       = module.ecs.cluster_arn
+}
+
+output "ecs_task_security_group_id" {
+  description = "Base security group for Fargate tasks."
+  value       = module.ecs.task_security_group_id
+}

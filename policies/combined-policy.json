@@ -112,6 +112,64 @@
       "Resource": "arn:aws:dynamodb:*:694992586025:table/family_dyning"
     },
     {
+      "Sid": "EcsClusterAndLogs",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:CreateCluster",
+        "ecs:DeleteCluster",
+        "ecs:DescribeClusters",
+        "ecs:UpdateCluster",
+        "ecs:UpdateClusterSettings",
+        "ecs:PutClusterCapacityProviders",
+        "ecs:TagResource",
+        "ecs:UntagResource",
+        "ecs:ListTagsForResource",
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:DescribeLogGroups",
+        "logs:PutRetentionPolicy",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource",
+        "logs:AssociateKmsKey",
+        "logs:DisassociateKmsKey"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsSecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcsTaskRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:ListInstanceProfilesForRole",
+        "iam:PassRole"
+      ],
+      "Resource": "arn:aws:iam::694992586025:role/aws-infrastructure-*"
+    },
+    {
       "Sid": "SelfManageAccessPolicy",
       "Effect": "Allow",
       "Action": [

@@ -16,3 +16,14 @@ module "vpc" {
     Environment = var.environment
   }
 }
+
+module "ecs" {
+  source = "../../modules/ecs"
+
+  name   = "${var.project}-${var.environment}"
+  vpc_id = module.vpc.vpc_id
+
+  container_insights  = true
+  enable_fargate_spot = false # prod: on-demand only, no Spot interruptions
+  log_retention_days  = 90
+}
