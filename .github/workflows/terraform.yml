@@ -4,16 +4,16 @@ name: Terraform
 #
 #   feature ──PR──► dev  ──push──►  deploy DEV
 #                    │
-#                    └──PR──► stg  ──push──►  deploy STG
+#                    └──PR to stg ─────►  build + deploy STG   (on the PR itself)
 #                              │
 #                              └──PR──► main ──push──► deploy PROD (manual approval)
 #
-# PRs run scans + plan for the target environment (the PR's base branch).
-# Pushes/merges deploy that environment. Prod is gated by the `prod` GitHub
-# Environment's required reviewers.
+#   - Push to dev            -> deploy dev
+#   - PR from dev into stg   -> deploy stg (auto, like dev)
+#   - PR from stg into main  -> plan prod; merge to main -> deploy prod (approval)
 on:
   push:
-    branches: [dev, stg, main]
+    branches: [dev, main]
     paths:
       - "environments/**"
       - "modules/**"
@@ -36,10 +36,11 @@ env:
   AWS_REGION: us-east-1
   TF_VERSION: "1.14.3"
 
-# Cancel superseded PR runs; never cancel an in-flight push/deploy.
+# Serialize per ref, and never cancel in-flight runs — a stg deploy now happens
+# on the PR itself, so cancelling mid-apply would be unsafe.
 concurrency:
   group: terraform-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -113,13 +114,14 @@ jobs:
           severity: HIGH,CRITICAL
 
   # ---------------------------------------------------------------------------
-  # Plan the target environment on PRs (review before merge). Read-only.
+  # Plan the target environment on PRs into dev or main (review before merge).
+  # Read-only. PRs into stg skip plan and deploy directly (see the deploy job).
   # Uses the pull_request OIDC sub, which the role trust already allows.
   # ---------------------------------------------------------------------------
   plan:
     name: Plan (${{ needs.target.outputs.env }})
     needs: [target, lint]
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && (github.base_ref == 'dev' || github.base_ref == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -150,14 +152,17 @@ jobs:
         run: terraform plan -no-color -input=false
 
   # ---------------------------------------------------------------------------
-  # Deploy the target environment on push/merge. Bound to the matching GitHub
-  # Environment, so `prod` can require manual approval before it runs. Applies
-  # the exact plan it just computed. Uses the environment-scoped OIDC sub.
+  # Deploy the target environment:
+  #   - push to dev/main          -> deploy dev / prod
+  #   - PR from dev into stg       -> deploy stg (build + deploy on the PR)
+  # Bound to the matching GitHub Environment, so `prod` can require manual
+  # approval before it runs. Applies the exact plan it just computed, using the
+  # environment-scoped OIDC sub.
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (${{ needs.target.outputs.env }})
     needs: [target, lint]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'stg')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: ${{ needs.target.outputs.env }}
