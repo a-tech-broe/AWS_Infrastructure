@@ -152,6 +152,15 @@
       "Resource": "*"
     },
     {
+      "Sid": "EcsServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "iam:AWSServiceName": "ecs.amazonaws.com" }
+      }
+    },
+    {
       "Sid": "EcsTaskRoles",
       "Effect": "Allow",
       "Action": [
